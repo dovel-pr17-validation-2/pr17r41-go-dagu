@@ -1,0 +1,86 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { render, screen } from '@testing-library/react';
+import React from 'react';
+import { describe, expect, it } from 'vitest';
+import type { components } from '@/api/v1/schema';
+import { StepDetails } from '../StepDetails';
+
+describe('StepDetails', () => {
+  it('renders harness commands as a prompt', () => {
+    const prompt = 'Review the implementation.\nReport every finding.';
+    const step = {
+      name: 'review',
+      commands: [{ command: prompt }],
+      executorConfig: {
+        type: 'harness',
+        config: {
+          provider: 'claude',
+        },
+      },
+    } as components['schemas']['Step'];
+
+    render(<StepDetails step={step} />);
+
+    expect(screen.getByText('Prompt')).toBeInTheDocument();
+    expect(screen.getByText(/Review the implementation/).textContent).toBe(
+      prompt
+    );
+  });
+
+  it('renders log executor messages as a first-class message field', () => {
+    const step = {
+      name: 'announce',
+      executorConfig: {
+        type: 'log',
+        config: {
+          message: 'Deploying ${ENVIRONMENT}',
+        },
+      },
+    } as components['schemas']['Step'];
+
+    render(<StepDetails step={step} />);
+
+    expect(screen.getByText('Executor')).toBeInTheDocument();
+    expect(screen.getByText('Message')).toBeInTheDocument();
+    expect(
+      screen.getByLabelText('Log message: Deploying ${ENVIRONMENT}')
+    ).toBeInTheDocument();
+  });
+
+  // The internal executor type of a call step is `dag`, or `subworkflow` in
+  // older files, words the UI does not use: the workflow it calls says it all.
+  it.each(['dag', 'subworkflow'])(
+    'shows the workflow that a call step calls, without its %s executor',
+    (type) => {
+      const step = {
+        name: 'call_a',
+        call: 'child-a',
+        executorConfig: { type, config: {} },
+      } as components['schemas']['Step'];
+
+      render(<StepDetails step={step} />);
+
+      expect(screen.getByText('Calls')).toBeInTheDocument();
+      expect(screen.getByText('child-a')).toBeInTheDocument();
+      expect(screen.queryByText('Sub DAG')).toBeNull();
+      expect(screen.queryByText('Executor')).toBeNull();
+      expect(screen.queryByText(type)).toBeNull();
+    }
+  );
+
+  // Settings of the executor are not in the Calls field: they stay.
+  it('keeps the executor of a call step that has settings', () => {
+    const step = {
+      name: 'call_a',
+      call: 'child-a',
+      executorConfig: { type: 'dag', config: { worker: 'gpu' } },
+    } as unknown as components['schemas']['Step'];
+
+    render(<StepDetails step={step} />);
+
+    expect(screen.getByText('Calls')).toBeInTheDocument();
+    expect(screen.getByText(/gpu/)).toBeInTheDocument();
+  });
+});

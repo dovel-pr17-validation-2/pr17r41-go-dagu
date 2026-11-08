@@ -1,0 +1,206 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package cmd_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/cmd"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/spec"
+	"github.com/dagucloud/dagu/v2/internal/test"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRestartCommand(t *testing.T) {
+	t.Parallel()
+
+	th := test.SetupCommand(t)
+
+	release := newHoldFile(t)
+	dag := th.DAG(t, fmt.Sprintf(`params: "p1"
+steps:
+  - name: "1"
+    run: "echo $1"
+  - name: "2"
+    run: %q
+`, holdUntilFileExistsCommand(release)))
+
+	// Start the DAG to restart.
+	done1 := make(chan struct{})
+	go func() {
+		args := []string{"start", `--params="foo"`, dag.Location}
+		th.RunCommand(t, cmd.Start(), test.CmdTest{Args: args})
+		close(done1)
+	}()
+
+	// Wait for the DAG to be running.
+	dag.AssertCurrentStatus(t, ir.Running)
+
+	// Restart the DAG.
+	done2 := make(chan struct{})
+	go func() {
+		args := []string{"restart", "--schedule-time=2026-03-13T10:00:00Z", dag.Location}
+		th.RunCommand(t, cmd.Restart(), test.CmdTest{Args: args})
+		close(done2)
+	}()
+	releaseDone := releaseHoldFileWhenRecentStatusCountAtLeast(t, th, dag.Name, 2, release)
+
+	// Wait for both executions to complete.
+	require.NoError(t, <-releaseDone)
+	<-done1
+	<-done2
+
+	// Check parameter was the same as the first execution
+	loaded, err := spec.Load(th.Context, dag.Location, spec.WithBaseConfig(th.Config.Paths.BaseConfig))
+	require.NoError(t, err)
+
+	// Check parameter was the same as the first execution
+	recentHistory, err := th.DAGRunRepository.RecentStatuses(th.Context, loaded.Name, 2)
+	require.NoError(t, err)
+
+	require.Len(t, recentHistory, 2)
+	require.Equal(t, recentHistory[0].Params, recentHistory[1].Params)
+	require.Equal(t, "2026-03-13T10:00:00Z", recentHistory[0].ScheduleTime)
+}
+
+// The scheduler starts the runs of a DAG with a restart_policy, so the restart
+// command, which starts a run of its own, is refused.
+func TestRestartCommand_RejectsServiceDAG(t *testing.T) {
+	t.Parallel()
+
+	th := test.SetupCommand(t)
+	dag := th.DAG(t, `restart_policy: always
+restart_wait_sec: 1
+steps:
+  - name: "1"
+    run: "echo ok"
+`)
+	th.RunCommand(t, cmd.Start(), test.CmdTest{Args: []string{"start", dag.Location}})
+
+	err := th.RunCommandWithError(t, cmd.Restart(), test.CmdTest{Args: []string{"restart", dag.Location}})
+	require.ErrorContains(t, err, `sets restart_policy "always"`)
+}
+
+// A DAG with a restart_policy that has no run yet is refused for its policy,
+// not for its missing history.
+func TestRestartCommand_RejectsServiceDAGWithoutRun(t *testing.T) {
+	t.Parallel()
+
+	th := test.SetupCommand(t)
+	dag := th.DAG(t, `restart_policy: always
+restart_wait_sec: 1
+steps:
+  - name: "1"
+    run: "echo ok"
+`)
+
+	err := th.RunCommandWithError(t, cmd.Restart(), test.CmdTest{Args: []string{"restart", dag.Location}})
+	require.ErrorContains(t, err, `sets restart_policy "always"`)
+}
+
+// The scheduler reads the current definition of a DAG, so a restart_policy
+// added while a run is alive already refuses the command, and that run is left
+// alone.
+func TestRestartCommand_RejectsPolicyAddedWhileRunning(t *testing.T) {
+	t.Parallel()
+
+	th := test.SetupCommand(t)
+	release := newHoldFile(t)
+	steps := fmt.Sprintf("steps:\n  - name: \"1\"\n    run: %q\n", holdUntilFileExistsCommand(release))
+	dag := th.DAG(t, steps)
+
+	done := make(chan struct{})
+	go func() {
+		th.RunCommand(t, cmd.Start(), test.CmdTest{Args: []string{"start", dag.Location}})
+		close(done)
+	}()
+	dag.AssertCurrentStatus(t, ir.Running)
+
+	require.NoError(t, os.WriteFile(dag.Location, []byte("restart_policy: always\nrestart_wait_sec: 1\n"+steps), 0o600))
+	err := th.RunCommandWithError(t, cmd.Restart(), test.CmdTest{Args: []string{"restart", dag.Location}})
+	require.ErrorContains(t, err, `sets restart_policy "always"`)
+	dag.AssertCurrentStatus(t, ir.Running)
+
+	releaseHoldFile(t, release)
+	<-done
+}
+
+// A run that is not running cannot be restarted, so the command says so even
+// when the DAG saved with the run cannot be read.
+func TestRestartCommand_NotRunningWithoutSnapshot(t *testing.T) {
+	t.Parallel()
+
+	th := test.SetupCommand(t)
+	dag := th.DAG(t, `steps:
+  - name: "1"
+    run: "echo ok"
+`)
+	th.RunCommand(t, cmd.Start(), test.CmdTest{Args: []string{"start", dag.Location}})
+
+	snapshots, err := filepath.Glob(filepath.Join(th.Config.Paths.DAGRunsDir, "*", "dag-runs", "*", "*", "*", "*", "*", "dag.json"))
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	require.NoError(t, os.Remove(snapshots[0]))
+
+	err = th.RunCommandWithError(t, cmd.Restart(), test.CmdTest{Args: []string{"restart", dag.Location}})
+	require.ErrorContains(t, err, "is not running")
+}
+
+func TestRestartCommand_BuiltExecutableRestoresExplicitEnv(t *testing.T) {
+	th := test.SetupCommand(t, test.WithBuiltExecutable())
+	t.Setenv("CMD_RESTART_EXPLICIT_ENV", "from-host")
+
+	holdTimeout := builtExecutableRestartWaitTimeout(t)
+	release := newHoldFile(t)
+	dag := th.DAG(t, fmt.Sprintf(`name: built-restart-explicit-env
+env:
+  - EXPORTED_SECRET: ${CMD_RESTART_EXPLICIT_ENV}
+steps:
+  - name: "hold"
+    run: %q
+  - name: "capture"
+    run: printf '%%s|%%s' "$EXPORTED_SECRET" "${CMD_RESTART_EXPLICIT_ENV:-}"
+    output: RESULT
+`, holdUntilFileExistsCommandWithin(release, holdTimeout)))
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- th.ExecuteCommand(cmd.Start(), test.CmdTest{
+			Args: []string{"start", dag.Location},
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		status, err := th.DAGRunMgr.GetCurrentStatus(th.Context, dag.DAG, "")
+		return err == nil && status != nil && status.Status == ir.Running
+	}, 10*time.Second, 100*time.Millisecond)
+
+	releaseDone := releaseHoldFileWhenRecentStatusCountAtLeastWithin(t, th, dag.Name, 2, release, holdTimeout)
+	test.RunBuiltCLI(t, th.Helper, []string{"CMD_RESTART_EXPLICIT_ENV=from-host"}, "restart", dag.Name)
+	require.NoError(t, <-releaseDone)
+
+	require.NoError(t, <-startDone)
+
+	latestStatus, err := th.DAGRunMgr.GetLatestStatus(th.Context, dag.DAG)
+	require.NoError(t, err)
+	require.Equal(t, ir.Succeeded, latestStatus.Status)
+	require.Equal(t, "from-host|", test.StatusOutputValue(t, &latestStatus, "RESULT"))
+
+	latestAttempt, err := th.DAGRunRepository.FindAttempt(th.Context, ir.NewDAGRunRef(dag.Name, latestStatus.DAGRunID))
+	require.NoError(t, err)
+	latestAttemptStatus, err := latestAttempt.ReadStatus(th.Context)
+	require.NoError(t, err)
+	require.Equal(t, "from-host|", test.StatusOutputValue(t, latestAttemptStatus, "RESULT"))
+}
+
+func builtExecutableRestartWaitTimeout(t *testing.T) time.Duration {
+	t.Helper()
+
+	return boundedWaitTimeout(t, 6*commandLogWaitTimeout())
+}

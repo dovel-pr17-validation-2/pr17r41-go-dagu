@@ -1,0 +1,115 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package scheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
+	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
+	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/intake"
+	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
+)
+
+// EnqueueCatchupRun enqueues a catchup run for a DAG. Restarts of a DAG with a
+// restart_policy are enqueued the same way, with their own trigger type.
+//
+// The function is idempotent: if a run with the same ID already exists
+// (checked via FindAttempt), it returns nil without creating a duplicate.
+//
+// On failure after CreateAttempt but before Enqueue, the orphaned attempt
+// record is cleaned up via RemoveDAGRun.
+//
+// The DAG is reloaded from source before persistence so queued catchup retries
+// inherit a complete execution snapshot. The reloaded DAG is then shallow-copied
+// to avoid mutating the shared planner entry (Location is cleared to prevent
+// unix pipe conflicts for concurrent runs).
+func EnqueueCatchupRun(
+	ctx context.Context,
+	dagRunRepository *persis.DAGRunRepository,
+	queueStore queuedomain.QueueStore,
+	baseLogDir string,
+	baseArtifactDir string,
+	baseConfig string,
+	workspaceBaseConfigDir string,
+	definitionID string,
+	dag *ir.DAG,
+	runID string,
+	triggerType ir.TriggerType,
+	scheduleTime time.Time,
+	profileName string,
+) error {
+	dagRun := ir.NewDAGRunRef(dag.Name, runID)
+
+	// Idempotency: skip if a run with this ID already exists.
+	_, err := dagRunRepository.FindAttempt(ctx, dagRun)
+	switch {
+	case err == nil:
+		logger.Info(ctx, "Run already exists; skipping",
+			tag.DAG(dag.Name),
+			tag.RunID(runID),
+			slog.String("trigger_type", triggerType.String()),
+		)
+		return nil
+	case errors.Is(err, dagrun.ErrNoStatusData) && triggerType == ir.TriggerTypeRestart:
+		// A crash cut its creation short. The next restart follows from the run
+		// before it, so the same ID comes back at every scan and the leftover
+		// must make way. Only the scheduler holding the lock queues restarts,
+		// so no other creation of the ID is in progress.
+		logger.Warn(ctx, "Replacing a restart run whose creation was cut short",
+			tag.DAG(dag.Name),
+			tag.RunID(runID),
+		)
+		if err := dagRunRepository.RemoveDAGRun(ctx, dagRun, persis.DAGRunRemoveOptions{}); err != nil {
+			return fmt.Errorf("failed to remove incomplete run: %w", err)
+		}
+	case !errors.Is(err, dagrun.ErrDAGRunIDNotFound):
+		return fmt.Errorf("failed to check existing run: %w", err)
+	}
+
+	fullDAG, err := rehydrateExecutionDAG(ctx, dag, nil, baseConfig, workspaceBaseConfigDir)
+	if err != nil {
+		return fmt.Errorf("failed to load full DAG for enqueue: %w", err)
+	}
+	if fullDAG == nil {
+		return fmt.Errorf("failed to load full DAG for enqueue: DAG is nil")
+	}
+	// Clone to avoid mutating the shared planner entry.
+	// Location is cleared to prevent unix pipe conflicts for concurrent runs
+	// (same as cmd/enqueue.go:87).
+	dagCopy := fullDAG.Clone()
+	dagCopy.Location = ""
+
+	_, err = intake.EnqueueRun(ctx, intake.QueueRequest{
+		DAGRunRepository: dagRunRepository,
+		QueueStore:       queueStore,
+		DAG:              dagCopy,
+		DAGRunID:         runID,
+		LogBaseDir:       baseLogDir,
+		ArtifactBaseDir:  baseArtifactDir,
+		TriggerType:      triggerType,
+		ScheduleTime:     stringutil.FormatTime(scheduleTime),
+		ProfileName:      profileName,
+		DefinitionID:     definitionID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to enqueue run: %w", err)
+	}
+
+	logger.Info(ctx, "Run enqueued",
+		tag.DAG(dag.Name),
+		tag.RunID(runID),
+		slog.String("trigger_type", triggerType.String()),
+	)
+
+	return nil
+}

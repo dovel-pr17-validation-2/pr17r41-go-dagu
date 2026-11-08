@@ -1,0 +1,485 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "api/**"
+      - "*.go"
+      - "**/*.go"
+      - "cmd/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "llms.txt"
+      - "skills/**"
+      - "Makefile"
+      - "proto/**"
+      - "scripts/ci/**"
+      - "scripts/e2e/**"
+      - "ui/**"
+      - ".github/actions/setup-go-cache/**"
+      - ".github/workflows/ci.yaml"
+      - ".github/opencode/**"
+  pull_request:
+    # Keep this workflow directly rerunnable from PR-only maintenance commits.
+    types:
+      - opened
+      - reopened # new commits are pushed to the branch that the PR is based on
+      - synchronize # new commits are pushed to the branch that the PR is based on
+      - ready_for_review # PR is ready for review
+    paths:
+      - "api/**"
+      - "*.go"
+      - "**/*.go"
+      - "cmd/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "llms.txt"
+      - "skills/**"
+      - "Makefile"
+      - "proto/**"
+      - "scripts/ci/**"
+      - "scripts/e2e/**"
+      - "ui/**"
+      - ".github/actions/setup-go-cache/**"
+      - ".github/workflows/ci.yaml"
+      - ".github/opencode/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new commit to a pull request cancels the run of the commit it
+  # replaces. Runs for a branch share one group and always finish: one runs
+  # at a time, and a newer commit replaces the run still waiting, so a burst
+  # of merges to main tests only the latest commit.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.27.3"
+  NODE_VERSION: "20"
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "go=true" >> "${GITHUB_OUTPUT}"
+            echo "e2e=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          base_sha=""
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            # The PR merge commit's first parent is the base branch it was
+            # merged into. pull_request.base.sha can predate that tip, which
+            # would count base branch commits as PR changes.
+            base_sha="$(git rev-parse "${GITHUB_SHA}^1")"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            base_sha="${{ github.event.before }}"
+          fi
+
+          if [[ -z "${base_sha}" || "${base_sha}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "go=true" >> "${GITHUB_OUTPUT}"
+            echo "e2e=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+            echo "Base commit ${base_sha} is not available locally; running CI conservatively."
+            echo "go=true" >> "${GITHUB_OUTPUT}"
+            echo "e2e=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${base_sha}" "${GITHUB_SHA}")"
+          printf '%s\n' "${changed_files}"
+
+          go_changed=false
+          e2e_changed=false
+          while IFS= read -r file; do
+            case "${file}" in
+              *.go|go.mod|go.sum|Makefile|llms.txt|skills/*|scripts/ci/*|.github/opencode/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
+                go_changed=true
+                ;;
+            esac
+
+            case "${file}" in
+              ui/*)
+                e2e_changed=true
+                ;;
+            esac
+
+          done <<< "${changed_files}"
+
+          echo "go=${go_changed}" >> "${GITHUB_OUTPUT}"
+          echo "e2e=${e2e_changed}" >> "${GITHUB_OUTPUT}"
+
+  # Lint Go code
+  golint:
+    name: Go Linter
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # The linter compiles plain export data for each GOOS, which the race
+      # and coverage builds of the test cache never hold, so it keeps a small
+      # cache of its own.
+      - name: Set up Go
+        id: go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-name: go-lint
+
+      - name: Check formatting (go fmt)
+        run: |
+          go fmt ./...
+          # Fail if formatting changed any files
+          git diff --exit-code || (echo "Go files are not formatted. Please run 'make fmt'" && exit 1)
+
+      - name: Check modernize (go fix)
+        run: |
+          diff=$(go fix -embedlit=false -diff ./... 2>&1) || true
+          if [ -n "$diff" ]; then
+            echo "Go files need modernization. Please run 'make fmt'"
+            echo "$diff"
+            exit 1
+          fi
+
+      - name: Check llms.txt is current
+        run: |
+          make llms
+          git diff --exit-code -- llms.txt || (echo "llms.txt is stale. Please run 'make llms'" && exit 1)
+
+      # The linter is built from this module's requirements, as make lint
+      # does, so it reads the export data of this module's Go; a release
+      # binary, or one built from the linter's own go.mod, cannot. It is
+      # built for the runner, before GOOS names the system to lint for.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          install-mode: none
+          args: --timeout=10m
+
+      # Files behind //go:build windows or darwin are invisible to a linter
+      # running for Linux, so the few packages that have such files are
+      # linted again for each of those systems.
+      - name: Run golangci-lint for Windows and macOS
+        run: |
+          status=0
+          for goos in windows darwin; do
+            packages="$(scripts/ci/goos-packages.sh "${goos}")"
+            [[ -n "${packages}" ]] || continue
+            echo "Linting $(wc -l <<< "${packages}") packages for ${goos}"
+            # shellcheck disable=SC2086 # packages is a newline-separated list.
+            GOOS="${goos}" golangci-lint run --timeout=10m ${packages} || status=1
+          done
+          exit "${status}"
+
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
+
+      - name: Save Go caches
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.cache-paths }}
+          key: ${{ steps.go.outputs.cache-key }}
+
+  test-ubuntu:
+    name: Test on ubuntu-latest (${{ matrix.suite }} ${{ matrix.shard }}/${{ matrix.shards }})
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suite: unit, shard: 1, shards: 3 }
+          - { suite: unit, shard: 2, shards: 3 }
+          - { suite: unit, shard: 3, shards: 3 }
+          # The integration suite runs about as long as a unit shard, so
+          # splitting it would only pay each job's setup again.
+          - { suite: intg, shard: 1, shards: 1 }
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        id: go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Login to Docker Hub
+        if: ${{ matrix.suite == 'intg' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pre-pull integration test images
+        if: ${{ matrix.suite == 'intg' }}
+        shell: bash
+        run: |
+          images=(
+            "alpine:3"
+            "busybox:latest"
+            "redis:7-alpine"
+            "bitnamilegacy/minio:2025.7.23-debian-12-r5"
+          )
+
+          for image in "${images[@]}"; do
+            for attempt in 1 2 3 4; do
+              if docker pull "${image}"; then
+                break
+              fi
+              if [[ "${attempt}" -eq 4 ]]; then
+                echo "failed to pull ${image}" >&2
+                exit 1
+              fi
+              sleep "$((attempt * 5))"
+            done
+          done
+
+      - name: Plan test shard
+        shell: bash
+        run: scripts/ci/go-test-suite.sh "${{ matrix.suite }}" "${{ matrix.shard }}" "${{ matrix.shards }}" > "${RUNNER_TEMP}/go-test-plan.tsv"
+
+      - name: Build
+        run: |
+          make bin
+
+      - name: Test
+        shell: bash
+        run: |
+          go install gotest.tools/gotestsum
+          status=0
+          group=0
+          while IFS=$'\t' read -r -u 3 packages run; do
+            group=$((group + 1))
+            args=(-v -race -count=1 -coverpkg=./... -covermode=atomic -coverprofile="coverage-${group}.out")
+            if [[ -n "${run}" ]]; then
+              args+=(-run "${run}")
+            fi
+            # shellcheck disable=SC2086 # packages is a space-separated list.
+            gotestsum --format=standard-quiet -- "${args[@]}" ${packages} || status=1
+          done 3< "${RUNNER_TEMP}/go-test-plan.tsv"
+          { echo "mode: atomic"; tail -q -n +2 coverage-*.out; } > coverage.out
+          exit "${status}"
+
+      # One shard saves the cache that every Go job restores; it compiles the
+      # binary and nearly every package with the race detector and coverage.
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
+
+      - name: Save Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.cache-paths }}
+          key: ${{ steps.go.outputs.cache-key }}
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: ./coverage.out
+          flags: ubuntu-${{ matrix.suite }}
+          name: ubuntu-${{ matrix.suite }}-${{ matrix.shard }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Checks that need a different toolchain setup than the test shards.
+  test-compat:
+    name: Test compatibility
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install tested OpenCode release
+        run: |
+          npm ci --ignore-scripts --prefix .github/opencode
+          mkdir -p .github/opencode/bin
+          cp .github/opencode/node_modules/opencode-linux-x64-baseline/bin/opencode .github/opencode/bin/opencode
+          chmod 0755 .github/opencode/bin/opencode
+          echo "${GITHUB_WORKSPACE}/.github/opencode/bin" >> "${GITHUB_PATH}"
+
+      - name: Test managed OpenCode capabilities
+        env:
+          DAGU_TEST_OPENCODE_EXECUTABLE: opencode
+          DAGU_TEST_OPENCODE_VERSION: 1.18.11
+        run: go test ./internal/opencodehost -run '^TestRealOpenCodeCapabilities$' -count=1
+
+      - name: Test managed OpenCode v2 execution
+        env:
+          DAGU_TEST_OPENCODE_V2_EXECUTABLE: ${{ github.workspace }}/.github/opencode/node_modules/@opencode/cli-linux-x64-baseline/bin/opencode
+        run: go test ./internal/runtime/builtin/harness -run '^TestRealV2Run$' -count=1
+
+      - name: Test with the legacy JSON backend
+        env:
+          GOEXPERIMENT: nojsonv2
+        run: go test ./internal/ir/... ./internal/persis/...
+
+      - name: Test jq on 386
+        env:
+          GOARCH: '386'
+          CGO_ENABLED: '0'
+        run: go test ./internal/runtime/builtin/jq
+
+  e2e:
+    name: E2E (${{ matrix.shard }}/${{ matrix.shard_total }})
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    # Playwright does not support Chromium on the ubuntu-26.04 image yet.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            shard_total: 3
+          - shard: 2
+            shard_total: 3
+          - shard: 3
+            shard_total: 3
+    concurrency:
+      group: ci-e2e-${{ github.event.pull_request.number || github.ref }}-shard-${{ matrix.shard }}
+      cancel-in-progress: true
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        working-directory: ui
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run browser E2E tests
+        env:
+          CI: "true"
+          DAGU_LICENSE_PRIVKEY_B64: ${{ secrets.DAGU_LICENSE_PRIVKEY_B64 }}
+          PLAYWRIGHT_FULLY_PARALLEL: "true"
+          PLAYWRIGHT_TEST_ARGS: --shard=${{ matrix.shard }}/${{ matrix.shard_total }}
+        run: |
+          make test-e2e-build
+          make test-e2e-run
+
+  test-windows:
+    name: Test on windows-latest (${{ matrix.suite }} ${{ matrix.shard }}/${{ matrix.shards }})
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suite: unit, shard: 1, shards: 2 }
+          - { suite: unit, shard: 2, shards: 2 }
+          - { suite: intg, shard: 1, shards: 2 }
+          - { suite: intg, shard: 2, shards: 2 }
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        id: go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Plan test shard
+        shell: bash
+        run: scripts/ci/go-test-suite.sh "${{ matrix.suite }}" "${{ matrix.shard }}" "${{ matrix.shards }}" > "${RUNNER_TEMP}/go-test-plan.tsv"
+
+      - name: Build (Windows)
+        shell: bash
+        run: |
+          mkdir -p ./.local/bin
+          go build -o ./.local/bin/dagu.exe ./cmd
+
+      - name: Test (Windows)
+        shell: bash
+        run: |
+          status=0
+          while IFS=$'\t' read -r -u 3 packages run; do
+            args=(-timeout=20m -count=1)
+            if [[ -n "${run}" ]]; then
+              args+=(-run "${run}")
+            fi
+            # shellcheck disable=SC2086 # packages is a space-separated list.
+            go test "${args[@]}" ${packages} || status=1
+          done 3< "${RUNNER_TEMP}/go-test-plan.tsv"
+          exit "${status}"
+
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
+
+      - name: Save Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.cache-paths }}
+          key: ${{ steps.go.outputs.cache-key }}
